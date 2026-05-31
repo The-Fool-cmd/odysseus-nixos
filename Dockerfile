@@ -1,4 +1,11 @@
-FROM python:3.12-slim
+FROM nvidia/cuda:12.6.3-devel-ubuntu24.04
+
+# Install Python 3.12
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 python3.12-venv python3-pip python3.12-dev \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python3 \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python \
+    && rm -rf /var/lib/apt/lists/*
 
 # System deps. tmux is required by Cookbook for background downloads/serves.
 # openssh-client is required for Cookbook remote server tests, setup, probes,
@@ -24,7 +31,7 @@ WORKDIR /app
 
 # Install Python deps first (layer cache)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
 
 # Copy app code
 COPY . .
