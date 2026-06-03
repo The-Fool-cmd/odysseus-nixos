@@ -55,7 +55,7 @@ def set_rag_manager(rag_mgr, personal_docs_mgr=None):
 # Model resolution
 # ---------------------------------------------------------------------------
 
-from src.endpoint_resolver import normalize_base as _normalize_base
+from src.endpoint_resolver import normalize_base as _normalize_base, build_chat_url, build_headers, build_models_url
 
 
 def _resolve_model(spec: str) -> Tuple[str, str, Dict]:
@@ -95,9 +95,7 @@ def _resolve_model(spec: str) -> Tuple[str, str, Dict]:
         for ep in endpoints:
             base = _normalize_base(ep.base_url)
             provider = _detect_provider(base)
-            headers = {}
-            if ep.api_key:
-                headers["Authorization"] = f"Bearer {ep.api_key}"
+            headers = build_headers(ep.api_key, base)
 
             if provider == "anthropic":
                 # Anthropic: match against hardcoded model list
@@ -107,27 +105,32 @@ def _resolve_model(spec: str) -> Tuple[str, str, Dict]:
                         matched = am
                         break
                 if matched:
-                    headers["x-api-key"] = ep.api_key or ""
-                    headers["anthropic-version"] = "2023-06-01"
-                    return base + "/v1/messages", matched, headers
+                    return build_chat_url(base), matched, headers
             else:
-                # OpenAI-compatible: probe /models
+                # OpenAI-compatible and native Ollama: probe the provider's model list.
                 try:
-                    r = httpx.get(base + "/models", headers=headers, timeout=5)
+                    r = httpx.get(build_models_url(base), headers=headers, timeout=5)
                     r.raise_for_status()
-                    model_ids = [m.get("id") for m in (r.json().get("data") or []) if m.get("id")]
+                    data = r.json()
+                    model_ids = [m.get("id") for m in (data.get("data") or []) if m.get("id")]
+                    if not model_ids:
+                        model_ids = [
+                            m.get("name") or m.get("model")
+                            for m in (data.get("models") or [])
+                            if m.get("name") or m.get("model")
+                        ]
                 except Exception:
                     model_ids = []
 
                 # Exact match first
                 for mid in model_ids:
                     if mid.lower() == model_name.lower():
-                        return base + "/chat/completions", mid, headers
+                        return build_chat_url(base), mid, headers
 
                 # Partial match
                 for mid in model_ids:
                     if model_name.lower() in mid.lower() or mid.lower() in model_name.lower():
-                        return base + "/chat/completions", mid, headers
+                        return build_chat_url(base), mid, headers
 
         raise ValueError(f"Model '{spec}' not found on any configured endpoint")
     finally:
@@ -514,7 +517,7 @@ async def do_list_sessions(content: str, session_id: Optional[str] = None, owner
         return {"error": str(e)}
 
 
-async def do_send_to_session(content: str, session_id: Optional[str] = None) -> Dict:
+async def do_send_to_session(content: str, session_id: Optional[str] = None, owner: Optional[str] = None) -> Dict:
     """Send a message to an existing session and get a response.
 
     Content format:
@@ -536,6 +539,10 @@ async def do_send_to_session(content: str, session_id: Optional[str] = None) -> 
 
     sess = _session_manager.get_session(target_sid)
     if not sess:
+        return {"error": f"Session '{target_sid}' not found"}
+
+    # Owner-scope: reject access to another user's session
+    if owner and getattr(sess, "owner", None) and sess.owner != owner:
         return {"error": f"Session '{target_sid}' not found"}
 
     if not message:
@@ -1107,18 +1114,23 @@ async def do_list_models(content: str, session_id: Optional[str] = None) -> Dict
         for ep in endpoints:
             base = _normalize_base(ep.base_url)
             provider = _detect_provider(base)
-            headers = {}
-            if ep.api_key:
-                headers["Authorization"] = f"Bearer {ep.api_key}"
+            headers = build_headers(ep.api_key, base)
 
             model_ids = []
             if provider == "anthropic":
                 model_ids = list(ANTHROPIC_MODELS)
             else:
                 try:
-                    r = httpx.get(base + "/models", headers=headers, timeout=5)
+                    r = httpx.get(build_models_url(base), headers=headers, timeout=5)
                     r.raise_for_status()
-                    model_ids = [m.get("id") for m in (r.json().get("data") or []) if m.get("id")]
+                    data = r.json()
+                    model_ids = [m.get("id") for m in (data.get("data") or []) if m.get("id")]
+                    if not model_ids:
+                        model_ids = [
+                            m.get("name") or m.get("model")
+                            for m in (data.get("models") or [])
+                            if m.get("name") or m.get("model")
+                        ]
                 except Exception:
                     model_ids = ["(endpoint offline)"]
 
@@ -1220,9 +1232,11 @@ async def do_manage_rag(content: str, session_id: Optional[str] = None) -> Dict:
 
         try:
             if hasattr(_personal_docs_manager, 'remove_directory'):
+                # Performs a targeted per-directory delete (#1660). The previous
+                # unconditional _rag_manager.rebuild_index() here wiped the whole
+                # collection on every remove (even for untracked dirs) and has
+                # been removed.
                 _personal_docs_manager.remove_directory(directory)
-            if _rag_manager and hasattr(_rag_manager, 'rebuild_index'):
-                _rag_manager.rebuild_index()
             return {"action": "remove_directory", "directory": directory,
                     "results": f"Directory '{directory}' removed from RAG index"}
         except Exception as e:
@@ -1280,7 +1294,7 @@ async def do_ui_control(content: str, session_id: Optional[str] = None) -> Dict:
             "private": "incognito",
         }
         toggle_name = _toggle_aliases.get(toggle_name, toggle_name)
-        valid_toggles = {"web", "bash", "research", "incognito", "document_editor"}
+        valid_toggles = {"web", "bash", "rag", "research", "incognito", "document_editor"}
         if toggle_name not in valid_toggles:
             return {"error": f"Unknown toggle '{toggle_name}'. Valid: {', '.join(sorted(valid_toggles))}"}
         return {
@@ -1761,7 +1775,7 @@ async def dispatch_ai_tool(
     elif tool == "send_to_session":
         sid = content.split("\n")[0].strip()[:20]
         desc = f"send_to_session: {sid}"
-        result = await do_send_to_session(content, session_id)
+        result = await do_send_to_session(content, session_id, owner=owner)
 
     elif tool == "pipeline":
         desc = "pipeline: running steps"
